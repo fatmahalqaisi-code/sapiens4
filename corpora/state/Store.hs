@@ -2,6 +2,7 @@
 module Store where
 
 import Control.Exception
+import Control.Concurrent.MVar
 import Control.Monad
 import Data.Aeson hiding (pairs)
 import Data.Int
@@ -13,6 +14,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding
 import Database.SQLite.Simple hiding (withTransaction)
+import qualified Database.SQLite.Simple as SQLite
 import System.FilePath
 import Text.Read (readMaybe)
 import Types
@@ -29,10 +31,21 @@ tableName table = case table of
  Preferences -> "preferences"
  SystemPulse -> "system_pulse"
 
+openDatabase :: FilePath -> IO Connection
+openDatabase root = bracketOnError (open (root </> "corpora.sqlite3")) close $ \db -> do
+ execute_ db "PRAGMA busy_timeout=10000"
+ execute_ db "PRAGMA foreign_keys=ON"
+ pure db
+closeDatabase :: Service -> IO ()
+closeDatabase s = modifyMVar_ (serviceDatabase s) $ \database -> mapM_ close database >> pure Nothing
+closeConnection :: Connection -> IO ()
+closeConnection = close
 connection :: Service -> (Connection -> IO a) -> IO a
-connection s = bracket (open (serviceRoot s </> "corpora.sqlite3")) close . (\f db -> execute_ db "PRAGMA busy_timeout=10000" >> execute_ db "PRAGMA foreign_keys=ON" >> f db)
+connection s action = withMVar (serviceDatabase s) $ maybe (failure 503 "Database is closed") action
 queryRows :: Service -> Text -> [Text] -> [SQLData] -> IO [Value]
-queryRows s sql columns args = connection s $ \db -> map (obj . zip columns . map val) <$> (query db (fromString (T.unpack sql)) args :: IO [[SQLData]])
+queryRows s sql columns args = connection s $ \db -> queryRowsOn db sql columns args
+queryRowsOn :: Connection -> Text -> [Text] -> [SQLData] -> IO [Value]
+queryRowsOn db sql columns args = map (obj . zip columns . map val) <$> (query db (fromString (T.unpack sql)) args :: IO [[SQLData]])
  where
  val SQLNull = Null
  val (SQLText t) = str t
@@ -40,7 +53,9 @@ queryRows s sql columns args = connection s $ \db -> map (obj . zip columns . ma
  val (SQLFloat n) = toJSON n
  val (SQLBlob _) = Null
 executeSQL :: Service -> Text -> [SQLData] -> IO ()
-executeSQL s sql args = connection s $ \db -> execute db (fromString (T.unpack sql)) args
+executeSQL s sql args = connection s $ \db -> executeOn db sql args
+executeOn :: Connection -> Text -> [SQLData] -> IO ()
+executeOn db sql args = execute db (fromString (T.unpack sql)) args
 sql :: Value -> SQLData
 sql Null = SQLNull
 sql (String t) = SQLText t
@@ -49,10 +64,14 @@ sql (Bool b) = SQLInteger (if b then 1 else 0)
 sql v = SQLText (jsonText v)
 values :: Service -> Collection -> IO [Value]
 values s table = queryRows s ("SELECT value FROM " <> tableName table <> " ORDER BY rowid") ["value"] [] >>= traverse (decodeStored . (`at` "value"))
+recentPulses :: Service -> IO [Value]
+recentPulses s = queryRows s "SELECT value FROM pulse_calls ORDER BY sequence DESC LIMIT 500" ["value"] [] >>= traverse (decodeStored . (`at` "value"))
 decodeStored :: FromJSON a => Text -> IO a
 decodeStored raw = either (failure 500 . T.pack) pure (eitherDecodeStrict (Data.Text.Encoding.encodeUtf8 raw))
 putValue :: Service -> Collection -> Text -> Value -> IO ()
-putValue s table i v = executeSQL s ("INSERT INTO " <> tableName table <> " VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value") [SQLText i,SQLText (jsonText v)]
+putValue s table i v = connection s $ \db -> putValueOn db table i v
+putValueOn :: Connection -> Collection -> Text -> Value -> IO ()
+putValueOn db table i v = executeOn db ("INSERT INTO " <> tableName table <> " VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value") [SQLText i,SQLText (jsonText v)]
 singleton :: Service -> Collection -> IO Value
 singleton s table = fromMaybe empty . listToMaybe <$> values s table
 saveSingleton :: Service -> Collection -> Value -> IO ()
@@ -97,14 +116,16 @@ saveAttachment s v = executeSQL s ("INSERT INTO " <> attachmentTable (at v "agen
 message :: Service -> Text -> Text -> [Value] -> IO ()
 message s i t as = executeSQL s "INSERT OR IGNORE INTO message_inputs VALUES (?,?,?)" [SQLText i,SQLText t,SQLText (jsonText (arr as))]
 record :: Service -> [Text] -> Text -> Text -> Value -> Text -> Maybe Text -> IO ()
-record s owners entity event details suppliedActor suppliedAgency = do
+record s owners entity event details suppliedActor suppliedAgency = connection s $ \db -> SQLite.withTransaction db $ recordOn s db owners entity event details suppliedActor suppliedAgency
+recordOn :: Service -> Connection -> [Text] -> Text -> Text -> Value -> Text -> Maybe Text -> IO ()
+recordOn s db owners entity event details suppliedActor suppliedAgency = do
  (source,kind) <- currentActor s
  let actor=if suppliedActor=="admin" then source else suppliedActor
      agency=if isJust suppliedAgency then suppliedAgency else kind
  time <- now
  forM_ (nub (owners ++ [actor | "sapi_" `T.isPrefixOf` actor])) $ \owner -> do
-  executeSQL s "INSERT INTO activity_events(owner,timestamp,actor,entity,event,agency,details) VALUES (?,?,?,?,?,?,?)" [SQLText owner,SQLText time,SQLText actor,SQLText entity,SQLText event,maybe SQLNull SQLText agency,SQLText (jsonText details)]
-  executeSQL s "DELETE FROM activity_events WHERE owner=? AND id NOT IN (SELECT id FROM activity_events WHERE owner=? ORDER BY id DESC LIMIT 100)" [SQLText owner,SQLText owner]
+  executeOn db "INSERT INTO activity_events(owner,timestamp,actor,entity,event,agency,details) VALUES (?,?,?,?,?,?,?)" [SQLText owner,SQLText time,SQLText actor,SQLText entity,SQLText event,maybe SQLNull SQLText agency,SQLText (jsonText details)]
+  executeOn db "DELETE FROM activity_events WHERE owner=? AND id NOT IN (SELECT id FROM activity_events WHERE owner=? ORDER BY id DESC LIMIT 100)" [SQLText owner,SQLText owner]
 events :: Service -> IO Value
 events s = do
  rows <- queryRows s "SELECT * FROM activity_events ORDER BY id DESC" ["id","owner","timestamp","actor","entity","event","agency","details"] []
@@ -112,26 +133,28 @@ events s = do
 project :: Service -> Text -> IO ()
 project s a = do
  state <- agentState s a
- forM_ (agentTurns state) $ \typed -> do
+ connection s $ \db -> SQLite.withTransaction db $ forM_ (agentTurns state) $ \typed -> do
   let turn=toJSON typed
-  previous <- queryRows s "SELECT status FROM turns WHERE id=?" ["status"] [sql (get turn "id")]
+  previous <- queryRowsOn db "SELECT status FROM turns WHERE id=?" ["status"] [sql (get turn "id")]
   let status = wireName (if turnStatus typed == Done && get turn "warning" /= Null then Warning else turnStatus typed)
       origin = get turn "origin" `fallback` empty
       owners = a : [at origin "group" | has origin "group"]
       old = maybe Null (get `flip` "status") (listToMaybe previous)
       actor = if status == "queued" then if has origin "routine" then "system" else at (put "author" (get origin "author" `fallback` str "admin") origin) "author" else a
-  when (old /= str status) $ record s owners (at turn "id") ("call." <> status) (obj [("previous",old),("origin",origin),("error",get turn "error"),("warning",get turn "warning")]) actor (Just (if has turn "output_order" then "chatOutput" else at turn "agency_kind"))
+  when (old /= str status) $ recordOn s db owners (at turn "id") ("call." <> status) (obj [("previous",old),("origin",origin),("error",get turn "error"),("warning",get turn "warning")]) actor (Just (if has turn "output_order" then "chatOutput" else at turn "agency_kind"))
   let details = selectPresent ["origin","batch_id","batch_members","agency_kind","slot","pulseId","output_at","output_order"] turn
-  putValue s TurnDetails (at turn "id") details
+  putValueOn db TurnDetails (at turn "id") details
   let output = listToMaybe [get m "content" | m <- items (stateJSON state) "chat",get m "turn" == get turn "id",at m "role" == "agent"]
   archived <- if isNothing output && status `elem` ["done","warning"] && batchLeader typed == turnId typed then readJSON (archivePath s a ("runs/" <> at turn "id")) empty else pure empty
-  executeSQL s "INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,output=COALESCE(excluded.output,turns.output),error=excluded.error" [sql (get turn "id"),SQLText a,sql (get turn "flow"),sql (get turn "input"),SQLText status,sql (fromMaybe (get archived "output") output),sql (get turn "error" `fallback` get turn "warning"),SQLInteger 0,sql (get turn "created")]
+  executeOn db "INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,output=COALESCE(excluded.output,turns.output),error=excluded.error WHERE turns.status IS NOT excluded.status OR turns.output IS NOT COALESCE(excluded.output,turns.output) OR turns.error IS NOT excluded.error" [sql (get turn "id"),SQLText a,sql (get turn "flow"),sql (get turn "input"),SQLText status,sql (fromMaybe (get archived "output") output),sql (get turn "error" `fallback` get turn "warning"),SQLInteger 0,sql (get turn "created")]
 turns :: Service -> IO [Value]
 turns s = do
  rows <- queryRows s "SELECT id,agent,flow,input,status,output,error,created FROM turns ORDER BY created,id" ["id","agent","flow","input","status","output","error","created"] []
  messages <- queryRows s "SELECT * FROM message_inputs" ["job","text","attachments"] []
  details <- queryRows s "SELECT * FROM turn_details" ["id","value"] []
- pure [let msg = fromMaybe empty (find (\m -> get m "job" == get v "id") messages); d = maybe empty (parseJSONText . (`at` "value")) (findId (at v "id") details) in merge (merge v d) (obj [("attachments",get msg "attachments" `asJSON` arr []),("input",get msg "text" `fallback` get v "input")]) | v <- rows]
+ let messagesById=M.fromList [(at m "job",m) | m<-messages]
+     detailsById=M.fromList [(at d "id",parseJSONText (at d "value")) | d<-details]
+ pure [let msg=M.findWithDefault empty (at v "id") messagesById; d=M.findWithDefault empty (at v "id") detailsById in merge (merge v d) (obj [("attachments",get msg "attachments" `asJSON` arr []),("input",get msg "text" `fallback` get v "input")]) | v <- rows]
  where asJSON (String t) _ = parseJSONText t; asJSON _ def = def
 saveRoutine :: Service -> Value -> IO Value
 saveRoutine s v = connection s $ \db -> do

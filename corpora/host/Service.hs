@@ -48,6 +48,7 @@ openService path = do
  root <- canonicalizePath path
  repo <- lookupEnv "SAPIENS_REPOSITORY" >>= maybe getCurrentDirectory pure >>= canonicalizePath
  lock <- tryLockFile (root </> "host.lock") Exclusive >>= maybe (failure 409 "Another Sapiens4 server is using this data directory") pure
+ database <- (DB.openDatabase root >>= newMVar . Just) `onException` unlockFile lock
  let initialize = do
       guard <- newMVar ()
       stopping <- newIORef False
@@ -57,7 +58,7 @@ openService path = do
       endpoint <- newIORef ""
       pulse <- newIORef empty
       actors <- newMVar M.empty
-      let s=Service root repo guard lock stopping worker runs lease endpoint pulse actors
+      let s=Service root repo guard lock stopping worker runs lease endpoint pulse actors database
       DB.initialize s
       let identityPath=root </> "corpora-identity.json"
       exists <- doesFileExist identityPath
@@ -88,7 +89,7 @@ openService path = do
       GC.dispatchGroups s
       DB.record s [chief] "corpora" "system.started" empty "system" Nothing
       pure s
- initialize `onException` unlockFile lock
+ initialize `onException` (withMVar database (mapM_ DB.closeConnection) `finally` unlockFile lock)
 attachEndpoint :: Service -> Text -> IO ()
 attachEndpoint s url = locked s $ do
  writeIORef (serviceEndpoint s) url
@@ -104,9 +105,9 @@ closeService s = do
   mapM_ (void . waitCatch) worker
   let awaitRuns = do runs<-readMVar (serviceRuns s); unless (M.null runs) (threadDelay 50000 >> awaitRuns)
   awaitRuns
-  chief <- DB.mainAgent s
-  DB.record s [chief] "corpora" "system.stopped" empty "system" Nothing
-  unlockFile (serviceFileLock s)
+  (do chief <- DB.mainAgent s
+      DB.record s [chief] "corpora" "system.stopped" empty "system" Nothing)
+   `finally` (DB.closeDatabase s `finally` unlockFile (serviceFileLock s))
 snapshot :: Service -> IO Value
 snapshot s = locked s (snapshotUnlocked s)
 snapshotUnlocked :: Service -> IO Value
@@ -123,7 +124,7 @@ snapshotUnlocked s = do
  agentRows <- forM rows $ \row -> put "retired" . Bool <$> retired s (at row "id") <*> pure row
  owner <- maybe Null (toJSON . fst) <$> readIORef (serviceLease s)
  built <- blindly s >>= doesFileExist
- pulses <- take 500 . reverse <$> DB.values s DB.PulseCalls
+ pulses <- DB.recentPulses s
  events <- DB.events s
  pulse <- readIORef (servicePulse s)
  chief <- DB.mainAgent s

@@ -26,6 +26,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Time
 import Data.Typeable
 import Data.Word (Word64)
+import Database.SQLite.Simple (Connection)
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
 import System.Directory
@@ -52,7 +53,7 @@ data RunFailure = RunFailure Text [Value] deriving (Show,Typeable)
 instance Exception RunFailure
 
 data Run = Run { runOwner :: AgentId, runId :: RunId, runSlot :: Int, runCancel :: IORef Bool, runProcess :: MVar (Maybe ProcessHandle), runActivity :: IORef Value, runDeadline :: Word64 }
-data Service = Service { serviceRoot :: FilePath, repositoryRoot :: FilePath, serviceGuard :: MVar (), serviceFileLock :: FileLock, serviceStopping :: IORef Bool, serviceWorker :: MVar (Maybe (Async ())), serviceRuns :: MVar (Map RunId Run), serviceLease :: IORef (Maybe (AgentId, RunId)), serviceEndpoint :: IORef Text, servicePulse :: IORef Value, serviceActors :: MVar (Map ThreadId (Text,Maybe Text)) }
+data Service = Service { serviceRoot :: FilePath, repositoryRoot :: FilePath, serviceGuard :: MVar (), serviceFileLock :: FileLock, serviceStopping :: IORef Bool, serviceWorker :: MVar (Maybe (Async ())), serviceRuns :: MVar (Map RunId Run), serviceLease :: IORef (Maybe (AgentId, RunId)), serviceEndpoint :: IORef Text, servicePulse :: IORef Value, serviceActors :: MVar (Map ThreadId (Text,Maybe Text)), serviceDatabase :: MVar (Maybe Connection) }
 
 decodeValue :: FromJSON a => Int -> Value -> IO a
 decodeValue code = parseValue code parseJSON

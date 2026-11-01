@@ -68,7 +68,9 @@ refresh runtime dispatch requested operation = attempt operation \result -> do
           preview runtime
         sync
     latest <- H.get
-    later (if M.remote latest || not latest.online then 2000.0 else 750.0) $ dispatch Poll
+    unless (D.b "hidden" latest.env) $
+      later (if M.remote latest || not latest.online then 2000.0 else 750.0) $
+        inEpoch latest.epoch \current -> when (current.active == latest.active && current.pollGeneration == latest.pollGeneration) $ dispatch Poll
 
 api :: C.Runtime -> M.Model -> String -> String -> Json -> Aff Json
 api runtime m path method body = do

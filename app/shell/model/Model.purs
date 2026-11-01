@@ -33,7 +33,7 @@ type Model =
   , mention :: Maybe { start :: Int, end :: Int, choices :: Array Json, index :: Int }
   , drafts :: O.Object String, attachments :: O.Object (Array Json), sending :: Set.Set String, uploading :: Int, clarification :: Maybe Json
   , workspaces :: Json, workspaceRevision :: Number, documents :: O.Object (RemoteData Json), expanded :: Set.Set String
-  , polling :: Boolean, saving :: Boolean, lastPreview :: Number, nativeReporting :: Boolean, nativeReports :: Array Json
+  , polling :: Boolean, pollGeneration :: Int, saving :: Boolean, lastPreview :: Number, nativeReporting :: Boolean, nativeReports :: Array Json
   , epoch :: Int, sequence :: Int, now :: Number, env :: Json
   , panes :: Array N.Pane, search :: String, searchOpen :: Boolean, menu :: Maybe String, dialog :: Maybe Dialog
   , records :: Array Json, active :: String, online :: Boolean, busy :: Boolean, localAvailable :: Boolean, showArchived :: Boolean
@@ -49,7 +49,7 @@ initial env =
   { snapshot:D.empty, agents:[], messages:O.empty, selected:"", activity:N.Chat N.Conversation, scope:N.All, groupView:Nothing
   , mention:Nothing, drafts:O.empty, attachments:O.empty, sending:Set.empty, uploading:0, clarification:Nothing
   , workspaces:D.empty, workspaceRevision:0.0, documents:O.empty, expanded:Set.empty
-  , polling:false,saving:false,lastPreview:0.0,nativeReporting:false,nativeReports:[]
+  , polling:false,pollGeneration:0,saving:false,lastPreview:0.0,nativeReporting:false,nativeReports:[]
   , epoch:0, sequence:0, now:0.0, env, panes:[N.ChatPane,N.Sidebar,N.Workspace], search:"", searchOpen:false, menu:Nothing, dialog:Nothing
   , records:[], active:"", online:false, busy:false, localAvailable:false, showArchived:false
   , toast:"", feedback:"", theme:if D.b "dark" env then "dark" else "light", installRequired:false

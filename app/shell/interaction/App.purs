@@ -69,9 +69,10 @@ handle runtime input = session input
     Finalize -> liftEffect $ C.dispose runtime
     Poll -> do
       m <- H.get
-      unless (m.polling || m.busy || m.active == "" || m.installRequired) do
-        H.modify_ _ { polling=true }
-        E.refresh runtime dispatch m $ E.api runtime m "/api/state" "GET" D.null
+      unless (m.polling || m.busy || m.active == "" || m.installRequired || D.b "hidden" m.env) do
+        let requested = m {polling=true,pollGeneration=m.pollGeneration+1}
+        H.put requested
+        E.refresh runtime dispatch requested $ E.api runtime requested "/api/state" "GET" D.null
     Copy text caption -> do
       result <- H.liftAff $ try $ toAffE $ B.clipboard text
       E.notify $ case result of

@@ -87,6 +87,10 @@ installMethods application = do
     on0 "quit" (void (obj1 (native application) "terminate:" nullPtr))
     on0 "reloadTab" (activeAction b "reload" 0)
     on0 "zoomIn" (activeAction b "zoom" 0.1)
+    on0 "restoreWorkspace" $ do
+        win <- readIORef (windowRef application)
+        void (obj1 win "deminiaturize:" nullPtr)
+        showWindow application
     on0 "zoomOut" (activeAction b "zoom" (-0.1))
     on0 "resetZoom" (activeAction b "zoom" 0)
     wrapBool2 (\_ _ _ _ -> showWindow application >> pure 1) >>= method c "applicationShouldHandleReopen:hasVisibleWindows:" "B@:@B"
@@ -135,6 +139,7 @@ menus application target = do
     appMenu <- subMenu root "Sapiens4"
     if fixture application then do
         menuItem appMenu target "Reload workspace" "reloadWorkspace" "r"
+        menuItem appMenu target "Restore workspace" "restoreWorkspace" "1"
         menuItem appMenu target "Quit" "quit" "q"
       else do
         menuItem appMenu (native application) "About Sapiens4" "orderFrontStandardAboutPanel:" ""
@@ -162,7 +167,7 @@ initialize application target address = do
     void (obj1 view "setAutoresizingMask:" (int 18))
     container <- allocated "NSView" >>= \o -> rect o "initWithFrame:" (0,0,1180,820)
     void (obj1 container "addSubview:" view)
-    win <- allocated "NSWindow" >>= \o -> window o 1180 820 (if fixture application then 11 else 15)
+    win <- allocated "NSWindow" >>= \o -> window o 1180 820 15
     writeIORef (windowRef application) win
     setText win "setTitle:" (if fixture application then "Sapiens4 behavior fixture" else "Sapiens4")
     void (obj1 win "setContentView:" container); void (obj1 win "setReleasedWhenClosed:" (int 0))
